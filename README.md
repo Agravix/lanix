@@ -6,6 +6,12 @@ Made by **Agravix**.
 
 ---
 
+## Screenshot
+
+![Lanix menu](./assets/screenshot.png)
+
+---
+
 ## Features
 
 - One-command install as a system-wide `lanix` command
