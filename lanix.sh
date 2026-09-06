@@ -101,13 +101,92 @@ install_dependencies() {
     echo -e "${GREEN}Dependencies installed.${NC}"
 }
 
-get_public_ip() {
-    local ip
-    ip="$(curl -s -4 --max-time 5 ifconfig.me || curl -s -4 --max-time 5 icanhazip.com)"
-    ip="$(echo "$ip" | tr -d '[:space:]')"
-    if [[ -z "$ip" ]]; then
-        read -rp "Could not auto-detect the server's public IP. Enter it manually: " ip
+is_valid_ip() {
+    local ip="$1"
+    if [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        for octet in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
+            if (( octet > 255 )); then
+                return 1
+            fi
+        done
+        return 0
     fi
+    return 1
+}
+
+is_private_ip() {
+    local ip="$1"
+    [[ "$ip" =~ ^10\. ]] && return 0
+    [[ "$ip" =~ ^127\. ]] && return 0
+    [[ "$ip" =~ ^169\.254\. ]] && return 0
+    [[ "$ip" =~ ^192\.168\. ]] && return 0
+    if [[ "$ip" =~ ^172\.([0-9]{1,3})\. ]]; then
+        local second="${BASH_REMATCH[1]}"
+        if (( second >= 16 && second <= 31 )); then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+detect_local_public_ip() {
+    local ip=""
+
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+')"
+    if is_valid_ip "$ip" && ! is_private_ip "$ip"; then
+        echo "$ip"
+        return 0
+    fi
+
+    ip="$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) print $i}' | while read -r candidate; do
+        if is_valid_ip "$candidate" && ! is_private_ip "$candidate"; then
+            echo "$candidate"
+            break
+        fi
+    done)"
+    if is_valid_ip "$ip" && ! is_private_ip "$ip"; then
+        echo "$ip"
+        return 0
+    fi
+
+    return 1
+}
+
+get_public_ip() {
+    local ip=""
+
+    ip="$(detect_local_public_ip)"
+    if is_valid_ip "$ip" && ! is_private_ip "$ip"; then
+        echo -e "${DIM}Detected public IP directly from this server's network interface: ${ip}${NC}" >&2
+        echo "$ip"
+        return 0
+    fi
+
+    local sources=(
+        "https://api.ipify.org"
+        "https://ifconfig.me/ip"
+        "https://icanhazip.com"
+        "https://ipv4.icanhazip.com"
+        "https://checkip.amazonaws.com"
+    )
+
+    for src in "${sources[@]}"; do
+        ip="$(curl -fsS -4 --max-time 3 "$src" 2>/dev/null | tr -d '[:space:]')"
+        if is_valid_ip "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+    done
+
+    ip=""
+    echo -e "${YELLOW}Could not auto-detect the server's public IP (local interface has no public address and external lookup services are unreachable, likely blocked/filtered on this network).${NC}" >&2
+    echo -e "${DIM}You can find your VPS's public IP in your hosting provider's control panel.${NC}" >&2
+    while ! is_valid_ip "$ip"; do
+        read -rp "Enter the server's public IP manually (e.g. 203.0.113.10): " ip
+        if ! is_valid_ip "$ip"; then
+            echo -e "${RED}That doesn't look like a valid IPv4 address. Try again.${NC}" >&2
+        fi
+    done
     echo "$ip"
 }
 
@@ -357,6 +436,43 @@ show_status() {
     wg show "$WG_IFACE"
 }
 
+fix_public_ip() {
+    if ! is_installed; then
+        echo -e "${RED}Server is not set up yet.${NC}"
+        return 1
+    fi
+
+    local old_ip=""
+    [[ -f "${WG_DIR}/.server_public_ip" ]] && old_ip="$(cat "${WG_DIR}/.server_public_ip")"
+    echo -e "${DIM}Currently stored public IP: ${old_ip:-none}${NC}"
+
+    local new_ip
+    new_ip="$(get_public_ip)"
+
+    if ! is_valid_ip "$new_ip"; then
+        echo -e "${RED}Detection failed and no valid IP was provided. Aborting.${NC}"
+        return 1
+    fi
+
+    echo "$new_ip" > "${WG_DIR}/.server_public_ip"
+    echo -e "${GREEN}Stored public IP updated to: ${new_ip}${NC}"
+
+    if [[ -d "$CLIENTS_DIR" ]] && [[ -n "$(ls -A "$CLIENTS_DIR" 2>/dev/null)" ]]; then
+        local updated=0
+        for d in "$CLIENTS_DIR"/*/; do
+            local name conf
+            name="$(basename "$d")"
+            conf="${d}${name}.conf"
+            if [[ -f "$conf" ]]; then
+                sed -i -E "s/^Endpoint = .*:([0-9]+)$/Endpoint = ${new_ip}:\1/" "$conf"
+                updated=$((updated + 1))
+            fi
+        done
+        echo -e "${GREEN}Updated the Endpoint line in ${updated} existing user config(s).${NC}"
+        echo -e "${YELLOW}Note: users must re-import/replace their .conf file (or scan the new QR code) to pick up the change.${NC}"
+    fi
+}
+
 client_guide() {
     load_env
     local server_ip="-"
@@ -443,6 +559,7 @@ print_usage() {
     echo "  lanix list            list all users and their internal IPs"
     echo "  lanix show <name>     show a user's config file and QR code"
     echo "  lanix status          show service and peer status"
+    echo "  lanix fix-ip          re-detect the server's public IP and update all user configs"
     echo "  lanix guide           show the client connection guide"
     echo "  lanix uninstall       remove Lanix and WireGuard entirely"
 }
@@ -506,6 +623,12 @@ menu_status() {
     press_enter
 }
 
+menu_fix_ip() {
+    banner
+    fix_public_ip
+    press_enter
+}
+
 menu_guide() {
     banner
     client_guide
@@ -545,6 +668,9 @@ build_menu() {
 
     MENU_LABELS+=("WireGuard service status")
     MENU_ACTIONS+=("menu_status")
+
+    MENU_LABELS+=("Fix / re-detect server public IP")
+    MENU_ACTIONS+=("menu_fix_ip")
 
     MENU_LABELS+=("Client connection guide (Linux / Windows / Android / iOS)")
     MENU_ACTIONS+=("menu_guide")
@@ -624,6 +750,9 @@ case "$1" in
         ;;
     status)
         show_status
+        ;;
+    fix-ip)
+        fix_public_ip
         ;;
     guide)
         client_guide
